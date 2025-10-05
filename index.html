@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>JS x86 VGA</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { margin: 0; background: #000000; color: #ddd; font: 14px/1.4 system-ui, sans-serif; }
+      header { padding: 8px 12px; gap: 12px; align-items: center; }
+      #screen {
+         margin: 0 auto; background: #000;
+        width: 640px; height: 400px; /* scale 2x */
+        image-rendering: pixelated; image-rendering: crisp-edges;
+        border: 1px solid #333; box-shadow: 0 0 16px rgba(0,0,0,0.6);
+      }
+      small { opacity: 0.7; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <button id="reset">Reset</button>
+      <button id="step">Step</button>
+      <button id="run">Run</button>
+      <input id="iso" type="file" accept=".iso" />
+      <small></small>
+    </header>
+    <div
+      id="trace"
+      style="padding:6px; font-family:monospace; background:#111; color:#0f0;"
+    >
+      CS:IP = 0000:7C00
+    </div>
+
+    <canvas id="screen" width="320" height="200"></canvas>
+
+    <script>
+      // Minimal emulator skeleton focused on VGA Mode 13h-like buffer.
+      class VGA {
+        constructor(canvas) {
+          this.canvas = canvas;
+          this.ctx = canvas.getContext("2d", { alpha: false });
+          this.w = 320;
+          this.h = 200;
+          this.vram8 = new Uint8Array(this.w * this.h); // 8-bit indexed color
+          this.palette = new Uint32Array(256); // ARGB32
+          this._initDefaultPalette();
+        }
+        _initDefaultPalette() {
+          // Simple 6x6x6 cube + greys, or make a smooth gradient.
+          let i = 0;
+          for (let r = 0; r < 6; r++) {
+            for (let g = 0; g < 6; g++) {
+              for (let b = 0; b < 6; b++) {
+                const R = Math.round(r * 51),
+                  G = Math.round(g * 51),
+                  B = Math.round(b * 51);
+                this.palette[i++] = (0xff << 24) | (R << 16) | (G << 8) | B;
+                if (i === 216) break;
+              }
+              if (i === 216) break;
+            }
+            if (i === 216) break;
+          }
+          while (i < 256) {
+            const v = Math.round(((i - 216) / 40) * 255);
+            this.palette[i++] = (0xff << 24) | (v << 16) | (v << 8) | v;
+          }
+        }
+        render() {
+          const img = this.ctx.createImageData(this.w, this.h);
+          const dst = new Uint32Array(img.data.buffer);
+          const src = this.vram8,
+            pal = this.palette;
+          for (let i = 0, n = src.length; i < n; i++)
+            dst[i] = pal[src[i]] >>> 0;
+          this.ctx.putImageData(img, 0, 0);
+        }
+      }
+      // ===== x86 16-bit real-mode CPU (minimal subset) =====
+      class X86CPU {
+        constructor(vga, diskBuf /* Uint8Array for ISO or image */) {
+          this.vga = vga;
+          this.mem = new Uint8Array(0x100000); // 1MiB
+          this.running = true;
+          this.cycles = 0;
+          this.reg32 = {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            esi: 0,
+            edi: 0,
+            ebp: 0,
+            esp: 0,
+            eip: 0,
+            eflags: 0x2,
+          };
+
+          // General registers (16-bit)
+          this.reg = {
+            ax: 0,
+            bx: 0,
+            cx: 0,
+            dx: 0,
+            si: 0,
+            di: 0,
+            bp: 0,
+            sp: 0x7c00, // sp 初期値は後で適宜
+            ip: 0x7c00,
+            cs: 0x0000,
+            ds: 0x0000,
+            es: 0x0000,
+            ss: 0x0000,
+            flags: 0x0002, // 初期: IF=0, ZF=SF=CF=0, bit1=1
+          };
+
+          // 外部ディスク（ISOやイメージ）を保持
+          this.disk = diskBuf || new Uint8Array();
+
+          // セグメントオーバーライド
+          this.segOverride = null; // 'cs'|'ds'|'es'|'ss' or null
+
+          // VGA の A0000 〜 A0000+64k をメモリにマップ（直結）
+          this.vgaBase = 0xa0000;
+          // 320*200 = 64000 byte をマップ対象にする
+        }
+
+        // ---- Helpers ----
+        lin(seg, off) {
+          return ((seg << 4) + (off & 0xffff)) & 0xfffff;
+        } // 20bit
+        rd8(seg, off) {
+          const a = this.lin(
+            this.segOverride ? this.reg[this.segOverride] : seg,
+            off
+          );
+          if (a >= this.vgaBase && a < this.vgaBase + this.vga.vram8.length)
+            return this.vga.vram8[a - this.vgaBase] | 0;
+          return this.mem[a] | 0;
+        }
+        wr8(seg, off, v) {
+          const a = this.lin(
+            this.segOverride ? this.reg[this.segOverride] : seg,
+            off
+          );
+          v &= 0xff;
+          if (a >= this.vgaBase && a < this.vgaBase + this.vga.vram8.length) {
+            this.vga.vram8[a - this.vgaBase] = v;
+            return;
+          }
+          this.mem[a] = v;
+        }
+        rd16(seg, off) {
+          const lo = this.rd8(seg, off);
+          const hi = this.rd8(seg, (off + 1) & 0xffff);
+          return (lo | (hi << 8)) & 0xffff;
+        }
+        wr16(seg, off, w) {
+          this.wr8(seg, off, w & 0xff);
+          this.wr8(seg, (off + 1) & 0xffff, (w >> 8) & 0xff);
+        }
+
+        // FLAGS
+        getZF() {
+          return this.reg.flags & 0x0040 ? 1 : 0;
+        }
+        setZF(b) {
+          this.reg.flags = b
+            ? this.reg.flags | 0x0040
+            : this.reg.flags & ~0x0040;
+        }
+        getSF() {
+          return this.reg.flags & 0x0080 ? 1 : 0;
+        }
+        setSF(b) {
+          this.reg.flags = b
+            ? this.reg.flags | 0x0080
+            : this.reg.flags & ~0x0080;
+        }
+        getCF() {
+          return this.reg.flags & 0x0001 ? 1 : 0;
+        }
+        setCF(b) {
+          this.reg.flags = b
+            ? this.reg.flags | 0x0001
+            : this.reg.flags & ~0x0001;
+        }
+        // OF 等は必要に応じて
+
+        // スタック（SS:SP）
+        push16(w) {
+          this.reg.sp = (this.reg.sp - 2) & 0xffff;
+          this.wr16(this.reg.ss, this.reg.sp, w & 0xffff);
+        }
+        pop16() {
+          const w = this.rd16(this.reg.ss, this.reg.sp);
+          this.reg.sp = (this.reg.sp + 2) & 0xffff;
+          return w;
+        }
+
+        // フェッチ
+        fetch8() {
+          const v = this.rd8(this.reg.cs, this.reg.ip);
+          this.reg.ip = (this.reg.ip + 1) & 0xffff;
+          return v;
+        }
+        fetch16() {
+          const w = this.rd16(this.reg.cs, this.reg.ip);
+          this.reg.ip = (this.reg.ip + 2) & 0xffff;
+          return w;
+        }
+
+        // ModRM デコード（最小版：メモ/レジスタ 16bit）
+        // r/m: 000..111 → [BX+SI], [BX+DI], [BP+SI], [BP+DI], [SI], [DI], [disp16], [BX] など
+        ea16(mod, rm) {
+          // リアルモードの有名アドレッシングテーブル（最小）
+          const add = (a, b) => (a + b) & 0xffff;
+          switch (rm) {
+            case 0:
+              return add(this.reg.bx, this.reg.si);
+            case 1:
+              return add(this.reg.bx, this.reg.di);
+            case 2:
+              return add(this.reg.bp, this.reg.si);
+            case 3:
+              return add(this.reg.bp, this.reg.di);
+            case 4:
+              return this.reg.si;
+            case 5:
+              return this.reg.di;
+            case 6:
+              return mod === 0 ? this.fetch16() : this.reg.bp;
+            case 7:
+              return this.reg.bx;
+          }
+        }
+
+        // INT ハンドラ（最小）
+        handleINT(intNum) {
+          switch (intNum) {
+            case 0x10:
+              return this.int10(); // video
+            case 0x13:
+              return this.int13(); // disk
+            case 0x16:
+              return this.int16(); // keyboard
+            default:
+              // 未実装: とりあえず無視 or HLT
+              this.running = false;
+              return;
+          }
+        }
+        int10() {
+          const ah = (this.reg.ax >> 8) & 0xff;
+          switch (ah) {
+            case 0x00: {
+              // Set video mode
+              const al = this.reg.ax & 0xff;
+              if (al === 0x13) this.vga.vram8.fill(0);
+              return;
+            }
+            case 0x0c: {
+              // Write pixel
+              const al = this.reg.ax & 0xff;
+              const x = this.reg.cx & 0xffff;
+              const y = this.reg.dx & 0xffff;
+              if (x < 320 && y < 200) {
+                this.vga.vram8[y * 320 + x] = al;
+              }
+              return;
+            }
+          }
+        }
+
+        int13() {
+          const ah = (this.reg.ax >> 8) & 0xff;
+          if (ah !== 0x02) {
+            this.setCF(1);
+            this.reg.ax = (0x01 << 8) | (this.reg.ax & 0xff);
+            return;
+          }
+          const al = this.reg.ax & 0xff; // sectors to read
+          const ch = (this.reg.cx >> 8) & 0xff;
+          const cl = this.reg.cx & 0xff;
+          const dh = (this.reg.dx >> 8) & 0xff;
+          const // geometry
+            spt = 18,
+            heads = 2,
+            bps = 512;
+
+          const cyl = ch | (((cl >> 6) & 0x03) << 8);
+          const sec = cl & 0x3f; // 1..18
+          const head = dh;
+          if (sec < 1 || sec > spt || head >= heads) {
+            this.setCF(1);
+            this.reg.ax = (0x04 << 8) | al;
+            return;
+          }
+
+          const lbaStart = (cyl * heads + head) * spt + (sec - 1);
+          const totalBytes = al * bps;
+          const srcByteStart = lbaStart * bps;
+
+          const esbx = this.lin(this.reg.es, this.reg.bx);
+          if (srcByteStart + totalBytes > this.disk.length) {
+            this.setCF(1);
+            this.reg.ax = (0x09 << 8) | al;
+            return;
+          }
+
+          for (let i = 0; i < totalBytes; i++) {
+            const v = this.disk[srcByteStart + i] || 0;
+            const dst = (esbx + i) & 0xfffff;
+            this.mem[dst] = v; // VGA領域には書かない
+          }
+          this.setCF(0);
+          this.reg.ax = (0x00 << 8) | al;
+        }
+
+        int16() {
+          const ah = (this.reg.ax >> 8) & 0xff;
+          switch (ah) {
+            case 0x01:
+              this.setZF(1);
+              this.setCF(0);
+              return; // なし
+            case 0x00:
+              this.setZF(1);
+              this.setCF(0);
+              return; // なし（簡略）
+            default:
+              this.setCF(1);
+              return;
+          }
+        }
+
+        // ---- 命令デコード（最小の例示）----
+        step() {
+          if (!this.running) return 0;
+
+          // 1命令内のプリフィックス状態
+          this.segOverride = null;
+          let opSize = 16; // 既定は16ビット（リアルモード）
+          let addrSize = 16;
+
+          // 複数プリフィックスを消費
+          let op = this.fetch8();
+          while (true) {
+            if (op === 0x66) {
+              opSize = 32;
+              op = this.fetch8();
+              continue;
+            } // operand-size
+            if (op === 0x67) {
+              addrSize = 32;
+              op = this.fetch8();
+              continue;
+            } // address-size
+            if (op === 0x26) {
+              this.segOverride = "es";
+              op = this.fetch8();
+              continue;
+            }
+            if (op === 0x2e) {
+              this.segOverride = "cs";
+              op = this.fetch8();
+              continue;
+            }
+            if (op === 0x36) {
+              this.segOverride = "ss";
+              op = this.fetch8();
+              continue;
+            }
+            if (op === 0x3e) {
+              this.segOverride = "ds";
+              op = this.fetch8();
+              continue;
+            }
+            break;
+          }
+
+          switch (op) {
+            // NOP / HLT
+            case 0x90:
+              return 1;
+            case 0xf4:
+              this.running = false;
+              return 1;
+
+            // INT imm8 → IVT経由
+            case 0xcd: {
+              const n = this.fetch8();
+              this.push16(this.reg.flags & 0xffff);
+              this.push16(this.reg.cs);
+              this.push16(this.reg.ip);
+              this.reg.flags &= ~(0x0200 | 0x0100); // IF/TFクリア
+              const vecOff = n * 4;
+              const newIP = this.rd16(0x0000, vecOff);
+              const newCS = this.rd16(0x0000, vecOff + 2);
+              this.reg.cs = newCS;
+              this.reg.ip = newIP;
+              return 2;
+            }
+
+            // IRET
+            case 0xcf: {
+              this.reg.ip = this.pop16();
+              this.reg.cs = this.pop16();
+              this.reg.flags = this.pop16() & 0xffff;
+              return 3;
+            }
+
+            // JMP short
+            case 0xeb: {
+              const disp = (this.fetch8() << 24) >> 24;
+              this.reg.ip = (this.reg.ip + disp) & 0xffff;
+              return 2;
+            }
+
+            // JZ/JNZ short
+            case 0x74: {
+              const disp = (this.fetch8() << 24) >> 24;
+              if (this.getZF()) this.reg.ip = (this.reg.ip + disp) & 0xffff;
+              return 2;
+            }
+            case 0x75: {
+              const disp = (this.fetch8() << 24) >> 24;
+              if (!this.getZF()) this.reg.ip = (this.reg.ip + disp) & 0xffff;
+              return 2;
+            }
+
+            // MOV r, imm (B8+rd) — opSizeでr16/r32切替
+            case 0xb8:
+            case 0xb9:
+            case 0xba:
+            case 0xbb:
+            case 0xbc:
+            case 0xbd:
+            case 0xbe:
+            case 0xbf: {
+              const rd = op - 0xb8;
+              if (opSize === 32) {
+                const imm = this.fetch32();
+                this.setR32(rd, imm >>> 0);
+                return 5;
+              } else {
+                const imm = this.fetch16();
+                this.setR16(rd, imm);
+                return 3;
+              }
+            }
+
+            // MOV r/m16, r16 (89) / MOV r16, r/m16 (8B) — opSizeで16/32切替
+            case 0x89:
+            case 0x8b: {
+              const modrm = this.fetch8();
+              const mod = (modrm >> 6) & 3,
+                reg = (modrm >> 3) & 7,
+                rm = modrm & 7;
+              if (opSize === 32) {
+                // 32ビット版
+                const { seg, off } = this.addrEA(addrSize, mod, rm);
+                if (op === 0x89) {
+                  const val = this.getR32(reg);
+                  this.wr32(seg, off, val >>> 0);
+                } else {
+                  const val = this.rd32(seg, off);
+                  this.setR32(reg, val >>> 0);
+                }
+              } else {
+                // 16ビット版
+                const { seg, off } = this.addrEA(addrSize, mod, rm);
+                if (op === 0x89) {
+                  const val = this.getR16(reg);
+                  this.wr16(seg, off, val);
+                } else {
+                  const val = this.rd16(seg, off);
+                  this.setR16(reg, val);
+                }
+              }
+              return 2;
+            }
+
+            // MOV r/m8, r8 (88) / MOV r8, r/m8 (8A) — addrSizeに従いEA計算
+            case 0x88:
+            case 0x8a: {
+              const modrm = this.fetch8();
+              const mod = (modrm >> 6) & 3,
+                reg = (modrm >> 3) & 7,
+                rm = modrm & 7;
+              if (mod === 3) {
+                if (op === 0x88) this.setR8(rm, this.getR8(reg));
+                else this.setR8(reg, this.getR8(rm));
+                return 2;
+              }
+              const { seg, off } = this.addrEA(addrSize, mod, rm);
+              if (op === 0x88) this.wr8(seg, off, this.getR8(reg));
+              else this.setR8(reg, this.rd8(seg, off));
+              return 2;
+            }
+
+            // MOV r/m, imm (C7 /0 for 16/32, C6 /0 for 8)
+            case 0xc7: {
+              const modrm = this.fetch8();
+              const mod = (modrm >> 6) & 3,
+                sub = (modrm >> 3) & 7,
+                rm = modrm & 7;
+              if (sub !== 0) {
+                this.running = false;
+                return 0;
+              }
+              const { seg, off } = this.addrEA(addrSize, mod, rm);
+              if (opSize === 32) {
+                const imm = this.fetch32();
+                this.wr32(seg, off, imm >>> 0);
+                return 6;
+              } else {
+                const imm = this.fetch16();
+                this.wr16(seg, off, imm);
+                return 4;
+              }
+            }
+            case 0xc6: {
+              const modrm = this.fetch8();
+              const mod = (modrm >> 6) & 3,
+                sub = (modrm >> 3) & 7,
+                rm = modrm & 7;
+              if (sub !== 0) {
+                this.running = false;
+                return 0;
+              }
+              const { seg, off } = this.addrEA(addrSize, mod, rm);
+              const imm = this.fetch8();
+              this.wr8(seg, off, imm & 0xff);
+              return 3;
+            }
+
+            // PUSH r (50+rd) / POP r (58+rd) — opSizeでスタック幅切替
+            case 0x50:
+            case 0x51:
+            case 0x52:
+            case 0x53:
+            case 0x54:
+            case 0x55:
+            case 0x56:
+            case 0x57: {
+              const rd = op - 0x50;
+              if (opSize === 32) this.push32(this.getR32(rd));
+              else this.push16(this.getR16(rd));
+              return 1;
+            }
+            case 0x58:
+            case 0x59:
+            case 0x5a:
+            case 0x5b:
+            case 0x5c:
+            case 0x5d:
+            case 0x5e:
+            case 0x5f: {
+              const rd = op - 0x58;
+              if (opSize === 32) this.setR32(rd, this.pop32() >>> 0);
+              else this.setR16(rd, this.pop16());
+              return 1;
+            }
+
+            default:
+              // 未実装オペコード
+              // this.running = false;
+              return 1;
+          }
+        }
+        // addrSizeに応じてEAを計算し、セグメントも確定
+        addrEA(addrSize, mod, rm) {
+          let off;
+          if (addrSize === 16) {
+            off = this.ea16(mod, rm);
+          } else {
+            off = this.ea32(mod, rm);
+          }
+          const seg = this.segOverride
+            ? this.reg[this.segOverride]
+            : this.reg.ds;
+          // プリフィックスは命令終了時にクリアされる前提（segOverrideはstep先頭で初期化済み）
+          return { seg, off };
+        }
+
+        // 既存の16ビットEA（BX+SI等）
+        ea16(mod, rm) {
+          const add = (a, b) => (a + b) & 0xffff;
+          switch (rm) {
+            case 0:
+              return add(this.reg.bx, this.reg.si);
+            case 1:
+              return add(this.reg.bx, this.reg.di);
+            case 2:
+              return add(this.reg.bp, this.reg.si);
+            case 3:
+              return add(this.reg.bp, this.reg.di);
+            case 4:
+              return this.reg.si;
+            case 5:
+              return this.reg.di;
+            case 6:
+              return mod === 0 ? this.fetch16() : this.reg.bp;
+            case 7:
+              return this.reg.bx;
+          }
+        }
+
+        // 最低限の32ビットEA（SIBは後回しの段階的対応）
+        ea32(mod, rm) {
+          // rm==4 はSIBだが、まずは未対応なら停止
+          if (rm === 4) {
+            // 将来: SIBデコード (scale,index,base)
+            this.running = false;
+            return 0;
+          }
+          const baseReg32 = (idx) => {
+            switch (idx) {
+              case 0:
+                return this.reg32.eax;
+              case 1:
+                return this.reg32.ecx;
+              case 2:
+                return this.reg32.edx;
+              case 3:
+                return this.reg32.ebx;
+              case 4:
+                return this.reg32.esp;
+              case 5:
+                return this.reg32.ebp;
+              case 6:
+                return this.reg32.esi;
+              case 7:
+                return this.reg32.edi;
+            }
+          };
+          if (mod === 0) {
+            if (rm === 5) {
+              // disp32のみ
+              return this.fetch32() & 0xffff; // Real-mode linear wrap
+            }
+            return baseReg32(rm) & 0xffff;
+          } else if (mod === 1) {
+            const disp8 = (this.fetch8() << 24) >> 24;
+            return (baseReg32(rm) + disp8) & 0xffff;
+          } else {
+            const disp32 = this.fetch32() >>> 0;
+            return (baseReg32(rm) + disp32) & 0xffff;
+          }
+        }
+        // 8ビット
+        getR8(idx) {
+          switch (idx & 7) {
+            case 0:
+              return this.reg32.eax & 0xff; // AL
+            case 1:
+              return (this.reg32.eax >> 8) & 0xff; // AH
+            case 2:
+              return this.reg32.ecx & 0xff; // CL
+            case 3:
+              return (this.reg32.ecx >> 8) & 0xff; // CH
+            case 4:
+              return this.reg32.edx & 0xff; // DL
+            case 5:
+              return (this.reg32.edx >> 8) & 0xff; // DH
+            case 6:
+              return this.reg32.ebx & 0xff; // BL
+            case 7:
+              return (this.reg32.ebx >> 8) & 0xff; // BH
+          }
+        }
+        setR8(idx, v) {
+          v &= 0xff;
+          switch (idx & 7) {
+            case 0:
+              this.reg32.eax = (this.reg32.eax & 0xffffff00) | v;
+              break;
+            case 1:
+              this.reg32.eax = (this.reg32.eax & 0xffff00ff) | (v << 8);
+              break;
+            case 2:
+              this.reg32.ecx = (this.reg32.ecx & 0xffffff00) | v;
+              break;
+            case 3:
+              this.reg32.ecx = (this.reg32.ecx & 0xffff00ff) | (v << 8);
+              break;
+            case 4:
+              this.reg32.edx = (this.reg32.edx & 0xffffff00) | v;
+              break;
+            case 5:
+              this.reg32.edx = (this.reg32.edx & 0xffff00ff) | (v << 8);
+              break;
+            case 6:
+              this.reg32.ebx = (this.reg32.ebx & 0xffffff00) | v;
+              break;
+            case 7:
+              this.reg32.ebx = (this.reg32.ebx & 0xffff00ff) | (v << 8);
+              break;
+          }
+        }
+
+        // 16ビット
+        getR16(idx) {
+          switch (idx & 7) {
+            case 0:
+              return this.reg32.eax & 0xffff;
+            case 1:
+              return this.reg32.ecx & 0xffff;
+            case 2:
+              return this.reg32.edx & 0xffff;
+            case 3:
+              return this.reg32.ebx & 0xffff;
+            case 4:
+              return this.reg.sp; // SPは16ビット枠で運用
+            case 5:
+              return this.reg.bp;
+            case 6:
+              return this.reg.si;
+            case 7:
+              return this.reg.di;
+          }
+        }
+        setR16(idx, w) {
+          w &= 0xffff;
+          switch (idx & 7) {
+            case 0:
+              this.reg32.eax = (this.reg32.eax & 0xffff0000) | w;
+              break;
+            case 1:
+              this.reg32.ecx = (this.reg32.ecx & 0xffff0000) | w;
+              break;
+            case 2:
+              this.reg32.edx = (this.reg32.edx & 0xffff0000) | w;
+              break;
+            case 3:
+              this.reg32.ebx = (this.reg32.ebx & 0xffff0000) | w;
+              break;
+            case 4:
+              this.reg.sp = w;
+              break;
+            case 5:
+              this.reg.bp = w;
+              break;
+            case 6:
+              this.reg.si = w;
+              break;
+            case 7:
+              this.reg.di = w;
+              break;
+          }
+        }
+
+        // 32ビット
+        getR32(idx) {
+          switch (idx & 7) {
+            case 0:
+              return this.reg32.eax >>> 0;
+            case 1:
+              return this.reg32.ecx >>> 0;
+            case 2:
+              return this.reg32.edx >>> 0;
+            case 3:
+              return this.reg32.ebx >>> 0;
+            case 4:
+              return this.reg32.esp >>> 0;
+            case 5:
+              return this.reg32.ebp >>> 0;
+            case 6:
+              return this.reg32.esi >>> 0;
+            case 7:
+              return this.reg32.edi >>> 0;
+          }
+        }
+        setR32(idx, v) {
+          v >>>= 0;
+          switch (idx & 7) {
+            case 0:
+              this.reg32.eax = v;
+              break;
+            case 1:
+              this.reg32.ecx = v;
+              break;
+            case 2:
+              this.reg32.edx = v;
+              break;
+            case 3:
+              this.reg32.ebx = v;
+              break;
+            case 4:
+              this.reg32.esp = v;
+              break;
+            case 5:
+              this.reg32.ebp = v;
+              break;
+            case 6:
+              this.reg32.esi = v;
+              break;
+            case 7:
+              this.reg32.edi = v;
+              break;
+          }
+        }
+
+        // r16 汎用レジスタの getter/setter（B8/50/58 等で使用）
+
+        fetch32() {
+          const b0 = this.fetch8();
+          const b1 = this.fetch8();
+          const b2 = this.fetch8();
+          const b3 = this.fetch8();
+          return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+
+        rd32(seg, off) {
+          const b0 = this.rd8(seg, off);
+          const b1 = this.rd8(seg, (off + 1) & 0xffff);
+          const b2 = this.rd8(seg, (off + 2) & 0xffff);
+          const b3 = this.rd8(seg, (off + 3) & 0xffff);
+          return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0;
+        }
+        wr32(seg, off, v) {
+          this.wr8(seg, off, v & 0xff);
+          this.wr8(seg, (off + 1) & 0xffff, (v >> 8) & 0xff);
+          this.wr8(seg, (off + 2) & 0xffff, (v >> 16) & 0xff);
+          this.wr8(seg, (off + 3) & 0xffff, (v >> 24) & 0xff);
+        }
+
+        // スタック（opSizeで切替。リアルモードでもESP/SS:ESPを使いたい場合のみ32）
+        push16(w) {
+          this.reg.sp = (this.reg.sp - 2) & 0xffff;
+          this.wr16(this.reg.ss, this.reg.sp, w & 0xffff);
+        }
+        pop16() {
+          const w = this.rd16(this.reg.ss, this.reg.sp);
+          this.reg.sp = (this.reg.sp + 2) & 0xffff;
+          return w;
+        }
+
+        push32(v) {
+          this.reg32.esp = (this.reg32.esp - 4) >>> 0;
+          this.wr32(this.reg.ss, this.reg32.esp & 0xffff, v >>> 0);
+        }
+        pop32() {
+          const v = this.rd32(this.reg.ss, this.reg32.esp & 0xffff);
+          this.reg32.esp = (this.reg32.esp + 4) >>> 0;
+          return v >>> 0;
+        }
+
+        // 算術（16/32ビット両対応の例）
+        updateZF(size, r) {
+          this.setZF((size === 32 ? r >>> 0 : r & 0xffff) === 0);
+        }
+        updateSF(size, r) {
+          const msb = size === 32 ? 0x80000000 : 0x8000;
+          this.setSF(r & msb ? 1 : 0);
+        }
+        addX(size, a, b) {
+          const mask = size === 32 ? 0xffffffff : 0xffff;
+          const full = (a & mask) + (b & mask);
+          const r = full & mask;
+          this.setCF(full > mask ? 1 : 0);
+          const sign = size === 32 ? 31 : 15;
+          const of = (((a ^ r) & (b ^ r)) >>> sign) & 1 ? 1 : 0;
+          this.reg.flags = of
+            ? this.reg.flags | 0x0800
+            : this.reg.flags & ~0x0800;
+          this.updateZF(size, r);
+          this.updateSF(size, r);
+          return r >>> 0;
+        }
+        subX(size, a, b) {
+          const mask = size === 32 ? 0xffffffff : 0xffff;
+          const full = (a & mask) - (b & mask);
+          const r = full & mask;
+          this.setCF((a & mask) < (b & mask) ? 1 : 0);
+          const sign = size === 32 ? 31 : 15;
+          const of = (((a ^ b) & (a ^ r)) >>> sign) & 1 ? 1 : 0;
+          this.reg.flags = of
+            ? this.reg.flags | 0x0800
+            : this.reg.flags & ~0x0800;
+          this.updateZF(size, r);
+          this.updateSF(size, r);
+          return r >>> 0;
+        }
+
+        // リセット（ブートセクタロード後に呼ぶ）
+        reset() {
+          this.running = true;
+          this.segOverride = null;
+          // 8086 実機は CS:IP=0000:7C00 へジャンプ
+          this.reg.cs = 0x0000;
+          this.reg.ip = 0x7c00;
+          this.reg.ds = 0x0000;
+          this.reg.es = 0x0000;
+          this.reg.ss = 0x0000;
+          this.reg.sp = 0x7c00; // 仮
+          this.reg.flags = 0x0002;
+        }
+      }
+
+      class Emulator {
+        constructor(canvas) {
+          this.vga = new VGA(canvas);
+          this.cpu = new X86CPU(this.vga);
+          this.last = 0;
+          this.budget = 20000;
+        }
+        attachDisk(buf) {
+          // x86 CPU を生成
+          this.cpu = new X86CPU(this.vga, buf);
+          // ブートセクタ（LBA0 の 512B を 0x0000:0x7C00 に配置）
+          const boot = buf.subarray(0, 512);
+          for (let i = 0; i < boot.length; i++)
+            this.cpu.wr8(0x0000, (0x7c00 + i) & 0xffff, boot[i]);
+          this.cpu.reset();
+        }
+        runSlice() {
+          for (let i = 0; i < this.budget && this.cpu.running; i++) {
+            this.cpu.step();
+          }
+          this.vga.render();
+        }
+      }
+
+      let totalSteps = 0;
+
+      function hex(v, w = 4) {
+        return v.toString(16).toUpperCase().padStart(w, "0");
+      }
+      function bin(v, w = 8) {
+        return v.toString(2).padStart(w, "0");
+      }
+
+      // Wiring
+      const canvas = document.getElementById("screen");
+      const emu = new Emulator(canvas);
+
+      // UI controls
+      const btnReset = document.getElementById("reset");
+      const btnStep = document.getElementById("step");
+      const btnRun = document.getElementById("run");
+      const isoInput = document.getElementById("iso");
+      function initIVT(cpu, biosCS, biosEntryIPByInt) {
+        // biosEntryIPByInt: { 0x10: 0x0100, 0x13: 0x0200, 0x16: 0x0300, ... }
+        for (const n in biosEntryIPByInt) {
+          const ip = biosEntryIPByInt[n] & 0xffff;
+          const cs = biosCS & 0xffff;
+          const off = (n | 0) * 4;
+          cpu.wr16(0x0000, off + 0, ip);
+          cpu.wr16(0x0000, off + 2, cs);
+        }
+      }
+      function updateTrace(cpu) {
+        const cs = cpu.reg.cs & 0xffff;
+        const ip = cpu.reg.ip & 0xffff;
+        document.getElementById("trace").textContent = `CS:IP = ${cs
+          .toString(16)
+          .padStart(4, "0")}:${ip.toString(16).padStart(4, "0")}`;
+      }
+
+      btnReset.onclick = () => {
+        emu.cpu = new X86CPU(emu.vga, window.loadedISO || null);
+        emu.cpu.reset();
+        emu.vga.vram8.fill(0);
+        emu.vga.render();
+        updateTrace(emu.cpu);
+      };
+
+      btnStep.onclick = () => {
+        if (emu.cpu.running) emu.cpu.step();
+
+        updateTrace(emu.cpu);
+        emu.vga.render();
+      };
+
+      let rafId = null;
+      btnRun.onclick = () => {
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+          btnRun.textContent = "Run";
+          return;
+        }
+        const loop = () => {
+          if (emu.cpu.running) {
+            emu.cpu.step();
+            emu.runSlice();
+            updateTrace(emu.cpu);
+            rafId = requestAnimationFrame(loop);
+          } else {
+            rafId = null;
+            btnRun.textContent = "Run";
+          }
+        };
+        btnRun.textContent = "Pause";
+
+        rafId = requestAnimationFrame(loop);
+      };
+
+      // Keyboard (stub to be connected to i8042 later)
+      window.addEventListener("keydown", (e) => {
+        // map e.code to scancode queue later
+        if (e.key === " ") e.preventDefault();
+      });
+
+      // ISO loader (stub)
+      isoInput.addEventListener("change", async () => {
+        const file = isoInput.files?.[0];
+        if (!file) return;
+        const buf = new Uint8Array(await file.arrayBuffer());
+        window.loadedISO = buf;
+        console.log("ISO loaded:", file.name, buf.length, "bytes");
+        console.log(buf);
+        // CPUを作り直してディスクを渡す
+
+        // ブートセクタ（先頭512バイト）を 0000:7C00 に配置
+        const boot = buf.subarray(0, 512);
+        for (let i = 0; i < boot.length; i++) {
+          emu.cpu.wr8(0x0000, (0x7c00 + i) & 0xffff, boot[i]);
+        }
+        //emu.attachDisk(buf);
+        updateTrace(emu.cpu);
+        // リセットして CS:IP=0000:7C00 から実行開始
+        emu.cpu.reset();
+      });
+
+      // Show something on load
+    </script>
+  </body>
+</html>
