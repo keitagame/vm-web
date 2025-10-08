@@ -212,14 +212,7 @@
         }
       }
       // 偶数パリティなら true を返す
-      function parity8(x) {
-        x &= 0xff;
-        let ones = 0;
-        for (let i = 0; i < 8; i++) {
-          ones += (x >> i) & 1;
-        }
-        return ones % 2 === 0;
-      }
+
       class Keyboard {
         constructor() {
           this.buffer = [];
@@ -528,12 +521,27 @@
           return getEA();
         }
 
+        // Decide if the address uses BP as a base register
+        usesBP(mod, rm) {
+          if (mod === 3) return false; // register-direct
+          if (rm === 2 || rm === 3) return true; // BP+SI, BP+DI
+          if (rm === 6) return mod !== 0; // BP when mod!=0; for mod==0 it's disp16 (no BP)
+          return false;
+        }
+
+        physFromEA(ea, useSS) {
+          const seg = useSS ? this.regs.SS : this.regs.DS;
+          return ((seg << 4) + (ea & 0xffff)) & 0xfffff;
+        }
+
         readOperand16(mod, rm, ea) {
           if (mod === 3) {
             const rn = this.rIndexToName(rm);
             return this.getReg16(rn);
           }
-          return this.read16(ea);
+          const useSS = this.usesBP(mod, rm);
+          const phys = this.physFromEA(ea, useSS);
+          return this.read16(phys);
         }
 
         writeOperand16(mod, rm, ea, v) {
@@ -541,9 +549,12 @@
             const rn = this.rIndexToName(rm);
             this.setReg16(rn, v);
           } else {
-            this.write16(ea, v);
+            const useSS = this.usesBP(mod, rm);
+            const phys = this.physFromEA(ea, useSS);
+            this.write16(phys, v);
           }
         }
+
         getReg8(index) {
           switch (index & 7) {
             case 0:
@@ -614,13 +625,15 @@
             (sf ? maskSF : 0);
         }
         // パリティ計算（偶数パリティなら1）
+
         parity8(x) {
           x &= 0xff;
           let ones = 0;
-          for (let i = 0; i < 8; i++) ones += (x >> i) & 1;
-          return ones % 2 === 0 ? 1 : 0;
+          for (let i = 0; i < 8; i++) {
+            ones += (x >> i) & 1;
+          }
+          return ones % 2 === 0;
         }
-
         setFlagsArith8 = function (op, a, b, res) {
           // マスク等
           a &= 0xff;
@@ -637,7 +650,8 @@
           let flags = this.FLAGS & ~(CF | PF | AF | ZF | SF | OF);
           if (res === 0) flags |= ZF;
           if (res & 0x80) flags |= SF;
-          if (parity8(res)) flags |= PF;
+
+          if (this.parity8(res)) flags |= PF;
 
           // AF: 下位ニブルのキャリー/ボロー
           const afSet = ((a ^ b ^ res) & 0x10) !== 0;
@@ -687,6 +701,7 @@
           // 他は必要に応じて
         }
         handleInt16() {
+          console.log("INT 16h", this.regs.AX.toString(16));
           const AH = (this.regs.AX >> 8) & 0xff;
 
           if (AH === 0x00) {
@@ -802,32 +817,55 @@
           }
 
           // RET (C3) も SS:SP ベースで
+          // RET (C3)
           if (op === 0xc3) {
-            const phys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
-            const ip = this.read16(phys);
+            const sPhys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
+            const ip = this.read16(sPhys);
             this.regs.SP = (this.regs.SP + 2) & 0xffff;
             this.regs.IP = ip;
+            this.cycles += 8; // 目安
             return;
           }
+
           if (op === 0x08) {
+            // OR r/m8, r8
             const { mod, reg, rm, ea } = this.decodeModRM();
             const src = this.getReg8(reg);
-            let dst;
             if (mod === 3) {
-              dst = this.getReg8(rm);
+              const dst = this.getReg8(rm);
+              const res = (dst | src) & 0xff;
+              this.setReg8(rm, res);
+              this.setFlagsLogical(res, 8);
             } else {
-              const phys = ((this.regs.DS << 4) + ea) & 0xfffff; // DS:EA
-              dst = this.read8(phys);
-            }
-            const res = (dst | src) & 0xff;
-            if (mod === 3) this.setReg8(rm, res);
-            else {
-              const phys = ((this.regs.DS << 4) + ea) & 0xfffff;
+              const useSS = this.usesBP(mod, rm);
+              const seg = useSS ? this.regs.SS : this.regs.DS;
+              const phys = ((seg << 4) + (ea & 0xffff)) & 0xfffff;
+              const dst = this.read8(phys);
+              const res = (dst | src) & 0xff;
               this.write8(phys, res);
+              this.setFlagsLogical(res, 8);
             }
-            this.setFlagsLogical(res, 8);
+            this.cycles += 3;
             return;
           }
+          if (op === 0x0a) {
+            // OR r8, r/m8
+            const { mod, reg, rm, ea } = this.decodeModRM();
+            const dst = this.getReg8(reg);
+            const src =
+              mod === 3
+                ? this.getReg8(rm)
+                : (() => {
+                    const useSS = this.usesBP(mod, rm);
+                    const phys = this.physFromEA(ea, useSS);
+                    return this.read8(phys);
+                  })();
+            const res = (dst | src) & 0xff;
+            this.setReg8(reg, res);
+            this.setFlagsLogical(res, 8); // ZF/SF/PF, CF/OF=0
+            return;
+          }
+
           if (op === 0x83) {
             const { mod, reg, rm, ea } = this.decodeModRM();
             const imm8 = this.fetch8();
@@ -868,30 +906,21 @@
           }
 
           // INC r16 (40-47)
+          // INC r16 (40-47)
           if ((op & 0xf8) === 0x40) {
             const regIndex = op & 7;
             const rn = this.rIndexToName(regIndex);
-            const val = (this.getReg16(rn) + 1) & 0xffff;
+            const cur = this.getReg16(rn);
+            const val = (cur + 1) & 0xffff;
+            // フラグは「cur + 1 → val」で計算し、その後レジスタへ書く
+            this.setFlagsArith16("add", cur, 1, val);
             this.setReg16(rn, val);
-            this.setFlagsArith16("add", this.getReg16(rn), 1, val);
             this.cycles += 2;
             return;
           }
+
           // OR r8, r/m8 (0x0A), OR r/m8, r8 (0x08) のどちらも必要
           // とりあえず OR AL,AL 専用の簡易版（汎用は後で）
-          if (op === 0x0a) {
-            const { mod, reg, rm, ea } = this.decodeModRM();
-            // reg は宛先r8、rm がソース r/m8
-            const dst = this.getReg8(reg);
-            const src =
-              mod === 3
-                ? this.getReg8(rm)
-                : this.read8(((this.regs.DS << 4) + ea) & 0xfffff);
-            const res = (dst | src) & 0xff;
-            this.setReg8(reg, res);
-            this.setFlagsLogical(res, 8);
-            return;
-          }
 
           // DEC r16 (48-4F)
           if ((op & 0xf8) === 0x48) {
@@ -985,11 +1014,21 @@
             // 他の /n は後で
           }
           // CMP AL, imm8 (0x3C)
+
           if (op === 0x3c) {
-            const imm = this.fetch8(); // ← 即値を必ず消費！
-            const al = this.getReg8(0); // AL
+            const before = this.regs.IP;
+            const imm = this.fetch8();
+            const al = this.getReg8(0);
             const res = (al - imm) & 0xff;
             this.setFlagsArith8("cmp", al, imm, res);
+            // 期待: IP は before + 1（fetch8 が1進める）になっている
+            // 命令長トータルでは 2 バイト消費（オペコード + 即値）なので、
+            // ログは「op=3C at X」「次の命令は X+2 で開始」を確認したい
+            console.log(
+              `cmp imm8 consumed at IP=${before.toString(
+                16
+              )} imm=${imm.toString(16)} nextIP=${this.regs.IP.toString(16)}`
+            );
             return;
           }
 
@@ -1026,13 +1065,9 @@
           if (op === 0x8e) {
             const { mod, reg, rm, ea } = this.decodeModRM();
             const val = this.readOperand16(mod, rm, ea);
-
             switch (reg) {
               case 0:
                 this.regs.ES = val;
-                break;
-              case 1:
-                this.regs.CS = val;
                 break;
               case 2:
                 this.regs.SS = val;
@@ -1040,12 +1075,13 @@
               case 3:
                 this.regs.DS = val;
                 break;
+              case 1:
+                throw new Error("MOV CS,r/m16 is invalid on 8086"); // 禁止
               default:
                 throw new Error(
                   `Unsupported segment reg index ${reg} in MOV Sreg,r/m16`
                 );
             }
-
             this.cycles += 2;
             return;
           }
@@ -1123,9 +1159,10 @@
             const rel = this.fetch16(); // 符号付き16bitオフセット
             const returnAddr = this.regs.IP & 0xffff;
 
-            // スタックに戻りアドレスを push
+            // スタックに戻りアドレスを push (SS:SP 基準)
             this.regs.SP = (this.regs.SP - 2) & 0xffff;
-            this.write16(this.regs.SP, returnAddr);
+            const sPhys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
+            this.write16(sPhys, returnAddr);
 
             // IP をジャンプ先に更新
             this.regs.IP = (this.regs.IP + this.sign16(rel)) & 0xffff;
@@ -1133,49 +1170,29 @@
             this.cycles += 5; // おおよそのサイクル数
             return;
           }
+
+          // JZ rel8 (0x74)
           if (op === 0x74) {
-            // JZ rel8
-            const rel = (this.fetch8() << 24) >> 24; // sign-extend 8→32
+            const rel = (this.fetch8() << 24) >> 24; // ここで必ず消費！
             if (this.getZF()) {
               this.regs.IP = (this.regs.IP + rel) & 0xffff;
             }
-            return;
-          }
-          // JZ rel8 (74)
-          if (op === 0x74) {
-            const rel8 = this.sign8(this.fetch8());
-            const ZF = (this.FLAGS >> 6) & 1;
-            if (ZF) this.regs.IP = (this.regs.IP + rel8) & 0xffff;
             this.cycles += 2;
             return;
           }
-          if (op === 0x08) {
-            const { mod, reg, rm, ea } = this.decodeModRM();
-            const src = this.getReg8(reg);
-            let dst;
-            if (mod === 3) {
-              dst = this.getReg8(rm);
-              const res = (dst | src) & 0xff;
-              this.setReg8(rm, res);
-              this.setFlagsLogical(res, 8);
-            } else {
-              const phys = ((this.regs.DS << 4) + ea) & 0xfffff;
-              dst = this.read8(phys);
-              const res = (dst | src) & 0xff;
-              this.write8(phys, res);
-              this.setFlagsLogical(res, 8);
-            }
-            this.cycles += 3;
-            return;
-          }
-          // JNZ rel8 (75)
+
+          // JNZ rel8 (0x75)
           if (op === 0x75) {
-            const rel8 = this.sign8(this.fetch8());
-            const ZF = (this.FLAGS >> 6) & 1;
-            if (!ZF) this.regs.IP = (this.regs.IP + rel8) & 0xffff;
+            const rel = (this.fetch8() << 24) >> 24; // ここで必ず消費！
+            if (!this.getZF()) {
+              this.regs.IP = (this.regs.IP + rel) & 0xffff;
+            }
             this.cycles += 2;
             return;
           }
+
+          // JNZ rel8 (75)
+
           // JMP rel8 (0xEB)
           if (op === 0xeb) {
             const rel = (this.fetch8() << 24) >> 24; // 符号拡張
