@@ -211,6 +211,118 @@
           // 未対応制御コードは無視
         }
       }
+      // 偶数パリティなら true を返す
+      function parity8(x) {
+        x &= 0xff;
+        let ones = 0;
+        for (let i = 0; i < 8; i++) {
+          ones += (x >> i) & 1;
+        }
+        return ones % 2 === 0;
+      }
+      class Keyboard {
+        constructor() {
+          this.buffer = [];
+          this.scancodeMap = {
+            // control keys
+            Enter: 0x1c,
+            Backspace: 0x0e,
+            Space: 0x39,
+            Tab: 0x0f,
+            Escape: 0x01,
+            // digits (top row)
+            Digit0: 0x0b,
+            Digit1: 0x02,
+            Digit2: 0x03,
+            Digit3: 0x04,
+            Digit4: 0x05,
+            Digit5: 0x06,
+            Digit6: 0x07,
+            Digit7: 0x08,
+            Digit8: 0x09,
+            Digit9: 0x0a,
+            // letters (US layout)
+            KeyA: 0x1e,
+            KeyB: 0x30,
+            KeyC: 0x2e,
+            KeyD: 0x20,
+            KeyE: 0x12,
+            KeyF: 0x21,
+            KeyG: 0x22,
+            KeyH: 0x23,
+            KeyI: 0x17,
+            KeyJ: 0x24,
+            KeyK: 0x25,
+            KeyL: 0x26,
+            KeyM: 0x32,
+            KeyN: 0x31,
+            KeyO: 0x18,
+            KeyP: 0x19,
+            KeyQ: 0x10,
+            KeyR: 0x13,
+            KeyS: 0x1f,
+            KeyT: 0x14,
+            KeyU: 0x16,
+            KeyV: 0x2f,
+            KeyW: 0x11,
+            KeyX: 0x2d,
+            KeyY: 0x15,
+            KeyZ: 0x2c,
+          };
+
+          document.addEventListener(
+            "keydown",
+            (e) => {
+              // Skip IME composition and pure modifier keys
+              if (
+                e.isComposing ||
+                e.key === "Shift" ||
+                e.key === "Control" ||
+                e.key === "Alt"
+              )
+                return;
+
+              // ASCII
+              let ascii = 0;
+              if (e.key.length === 1) {
+                ascii = e.key.charCodeAt(0);
+              } else if (e.key === "Enter") {
+                ascii = 0x0d;
+              } else if (e.key === "Backspace") {
+                ascii = 0x08;
+              } else if (e.key === "Tab") {
+                ascii = 0x09;
+              } else if (e.key === "Escape") {
+                ascii = 0x1b;
+              } else if (e.key === " ") {
+                ascii = 0x20;
+              }
+
+              // Scancode (set 1)
+              const scancode = this.scancodeMap[e.code] ?? 0;
+
+              // Push only meaningful keys
+              if (ascii !== 0 || scancode !== 0) {
+                this.buffer.push({ ascii, scancode });
+                e.preventDefault();
+              }
+            },
+            { capture: true }
+          );
+        }
+
+        // Non-blocking: return next key or null
+        getKeyBlocking() {
+          return this.buffer.length ? this.buffer.shift() : null;
+        }
+
+        // Peek for AH=01 without consuming
+        peek() {
+          return this.buffer.length ? this.buffer[0] : null;
+        }
+      }
+
+      // エミュレータに組み込む
 
       class CPU8086 {
         constructor(memSize = 0x100000) {
@@ -237,29 +349,30 @@
           this.FLAGS = 0; // bitmask: CF=1<<0, PF=1<<2, AF=1<<4, ZF=1<<6, SF=1<<7, OF=1<<11
           this.cycles = 0;
           this.halted = false;
-          this.kbd = {
-            getKeyBlocking: () => {
-              // ここでは常に Enter を返す例
-              return { ascii: 0x0d, scancode: 0x1c };
-            },
-          };
+
+          this.kbd = new Keyboard();
         }
 
+        // エミュレータに組み込む
+
+        getZF() {
+          return ((this.FLAGS >> 6) & 1) !== 0;
+        }
         // Helpers
         read8(addr) {
           return this.mem[addr & 0xfffff];
         }
         write8(addr, v) {
-          this.mem[addr & 0xffff] = v & 0xff;
+          this.mem[addr & 0xfffff] = v & 0xff;
         }
         read16(addr) {
-          const lo = this.read8(addr),
-            hi = this.read8(addr + 1);
-          return lo | (hi << 8);
+          const a = addr & 0xfffff;
+          return this.mem[a] | (this.mem[(a + 1) & 0xfffff] << 8);
         }
-        write16(addr, v) {
-          this.write8(addr, v & 0xff);
-          this.write8(addr + 1, (v >> 8) & 0xff);
+        write16(addr, val) {
+          const a = addr & 0xfffff;
+          this.mem[a] = val & 0xff;
+          this.mem[(a + 1) & 0xfffff] = (val >> 8) & 0xff;
         }
         fetch8() {
           const phys = ((this.regs.CS << 4) + this.regs.IP) & 0xfffff;
@@ -500,6 +613,63 @@
             (zf ? maskZF : 0) |
             (sf ? maskSF : 0);
         }
+        // パリティ計算（偶数パリティなら1）
+        parity8(x) {
+          x &= 0xff;
+          let ones = 0;
+          for (let i = 0; i < 8; i++) ones += (x >> i) & 1;
+          return ones % 2 === 0 ? 1 : 0;
+        }
+
+        setFlagsArith8 = function (op, a, b, res) {
+          // マスク等
+          a &= 0xff;
+          b &= 0xff;
+          res &= 0xff;
+          const CF = 1 << 0,
+            PF = 1 << 2,
+            AF = 1 << 4,
+            ZF = 1 << 6,
+            SF = 1 << 7,
+            OF = 1 << 11;
+
+          // 共通: ZF, SF, PF 更新
+          let flags = this.FLAGS & ~(CF | PF | AF | ZF | SF | OF);
+          if (res === 0) flags |= ZF;
+          if (res & 0x80) flags |= SF;
+          if (parity8(res)) flags |= PF;
+
+          // AF: 下位ニブルのキャリー/ボロー
+          const afSet = ((a ^ b ^ res) & 0x10) !== 0;
+
+          // OF/CF は演算種類で異なる
+          if (op === "add") {
+            // CF: 加算キャリー
+            const cfSet = a + b > 0xff;
+            // OF: 符号付きオーバーフロー
+            const ofSet = (~(a ^ b) & (a ^ res) & 0x80) !== 0;
+
+            if (cfSet) flags |= CF;
+            if (afSet) flags |= AF;
+            if (ofSet) flags |= OF;
+          } else if (op === "sub" || op === "cmp") {
+            // CF: 減算ボロー（a < b）
+            const cfSet = a < b;
+            // OF: 符号付きオーバーフロー
+            const ofSet = ((a ^ b) & (a ^ res) & 0x80) !== 0;
+
+            if (cfSet) flags |= CF;
+            if (afSet) flags |= AF;
+            if (ofSet) flags |= OF;
+          } else if (op === "test") {
+            // TEST は論理演算と同様に CF=OF=0, AFは触らない（一般に未定義）
+            // 既に ZF/SF/PF は設定済み
+          } else {
+            // 必要なら他の算術に拡張
+          }
+
+          this.FLAGS = flags;
+        };
 
         handleInt10() {
           console.log("INT 10h", this.regs.AX.toString(16));
@@ -517,14 +687,35 @@
           // 他は必要に応じて
         }
         handleInt16() {
-          const ah = (this.regs.AX >> 8) & 0xff;
-          if (ah === 0x00) {
-            // キー待ち
-            const { ascii, scancode } = this.kbd.getKeyBlocking(); // or queue/pop
-            this.regs.AX = (scancode << 8) | ascii;
+          const AH = (this.regs.AX >> 8) & 0xff;
+
+          if (AH === 0x00) {
+            // Read key (blocking)
+            const key = this.kbd.getKeyBlocking();
+            if (!key) {
+              // No key yet: emulate block by doing nothing this step
+              // Program will re-enter INT 16h next frame
+              return;
+            }
+            this.regs.AX = ((key.scancode & 0xff) << 8) | (key.ascii & 0xff);
             return;
           }
+
+          if (AH === 0x01) {
+            // Check keystroke (non-blocking)
+            const key = this.kbd.peek();
+            if (key) {
+              this.regs.AX = ((key.scancode & 0xff) << 8) | (key.ascii & 0xff);
+              this.FLAGS &= ~(1 << 6); // ZF=0
+            } else {
+              this.FLAGS |= 1 << 6; // ZF=1
+            }
+            return;
+          }
+
+          // Optionally implement AH=0x02 (get shift flags), etc.
         }
+
         handleInt15() {
           console.log("INT 15h", this.regs.AX.toString(16));
           const ah = (this.regs.AX >> 8) & 0xff;
@@ -551,23 +742,7 @@
             this.cycles++;
             return;
           }
-          if (op === 0xac) {
-            const phys = ((this.regs.DS << 4) + this.regs.SI) & 0xfffff;
-            const val = this.read8(phys);
-            this.setReg8(0, val); // AL ← val
-            this.regs.SI = (this.regs.SI + (this.getDF() ? -1 : 1)) & 0xffff;
-            this.cycles += 6; // 目安
-            return;
-          }
-          if (op === 0xac) {
-            // LODSB
-            const phys = ((this.regs.DS << 4) + this.regs.SI) & 0xfffff;
-            const al = this.read8(phys); // 物理メモリから読む
-            this.setReg8(0, al); // AL
-            this.regs.SI = (this.regs.SI + (this.getDF() ? -1 : 1)) & 0xffff;
-            this.cycles += 6;
-            return;
-          }
+
           if (op === 0xcd) {
             console.log("INT instruction");
             const intNum = this.fetch8();
@@ -588,6 +763,51 @@
               return;
             }
             throw new Error(`INT ${intNum.toString(16)}h 未実装`);
+          }
+          if ((op & 0xf8) === 0x50) {
+            const rn = this.rIndexToName(op & 7);
+            const val = this.getReg16(rn);
+            this.regs.SP = (this.regs.SP - 2) & 0xffff;
+            const phys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
+            this.write16(phys, val);
+            return;
+          }
+          // XOR r/m8, r8 (0x30 /r)
+          if (op === 0x30) {
+            const { mod, reg, rm, ea } = this.decodeModRM();
+            const src = this.getReg8(reg);
+            if (mod === 3) {
+              const dst = this.getReg8(rm);
+              const res = (dst ^ src) & 0xff;
+              this.setReg8(rm, res);
+              this.setFlagsLogical(res, 8);
+            } else {
+              const phys = ((this.regs.DS << 4) + ea) & 0xfffff;
+              const dst = this.read8(phys);
+              const res = (dst ^ src) & 0xff;
+              this.write8(phys, res);
+              this.setFlagsLogical(res, 8);
+            }
+            return;
+          }
+
+          // POP r16 (58–5F)
+          if ((op & 0xf8) === 0x58) {
+            const rn = this.rIndexToName(op & 7);
+            const phys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
+            const val = this.read16(phys);
+            this.regs.SP = (this.regs.SP + 2) & 0xffff;
+            this.setReg16(rn, val);
+            return;
+          }
+
+          // RET (C3) も SS:SP ベースで
+          if (op === 0xc3) {
+            const phys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
+            const ip = this.read16(phys);
+            this.regs.SP = (this.regs.SP + 2) & 0xffff;
+            this.regs.IP = ip;
+            return;
           }
           if (op === 0x08) {
             const { mod, reg, rm, ea } = this.decodeModRM();
@@ -685,33 +905,10 @@
             return;
           }
           if (op === 0xac) {
-            // LODSB
-            const addr = ((this.regs.DS << 4) + this.regs.SI) & 0xfffff;
-            const al = this.mem[addr & 0xffff];
-            this.regs.AX = (this.regs.AX & 0xff00) | al;
+            const phys = ((this.regs.DS << 4) + this.regs.SI) & 0xfffff;
+            const val = this.read8(phys);
+            this.setReg8(0, val); // AL
             this.regs.SI = (this.regs.SI + (this.getDF() ? -1 : 1)) & 0xffff;
-            this.cycles += 6; // 目安
-            return;
-          }
-          // PUSH r16 (50-57)
-          if ((op & 0xf8) === 0x50) {
-            const regIndex = op & 7;
-            const rn = this.rIndexToName(regIndex);
-            const val = this.getReg16(rn);
-            this.regs.SP = (this.regs.SP - 2) & 0xffff;
-            this.write16(this.regs.SP, val);
-            this.cycles += 3;
-            return;
-          }
-
-          // POP r16 (58-5F)
-          if ((op & 0xf8) === 0x58) {
-            const regIndex = op & 7;
-            const rn = this.rIndexToName(regIndex);
-            const val = this.read16(this.regs.SP);
-            this.regs.SP = (this.regs.SP + 2) & 0xffff;
-            this.setReg16(rn, val);
-            this.cycles += 3;
             return;
           }
 
@@ -786,6 +983,14 @@
               return;
             }
             // 他の /n は後で
+          }
+          // CMP AL, imm8 (0x3C)
+          if (op === 0x3c) {
+            const imm = this.fetch8(); // ← 即値を必ず消費！
+            const al = this.getReg8(0); // AL
+            const res = (al - imm) & 0xff;
+            this.setFlagsArith8("cmp", al, imm, res);
+            return;
           }
 
           // SHL r/m16,1 (D1 /4), SHR r/m16,1 (D1 /5)
@@ -865,13 +1070,6 @@
             return;
           }
           // RET (C3)
-          if (op === 0xc3) {
-            const addr = this.read16(this.regs.SP);
-            this.regs.SP = (this.regs.SP + 2) & 0xffff;
-            this.regs.IP = addr;
-            this.cycles += 5;
-            return;
-          }
 
           // ADD r/m16, imm16 (81 /0) — here we implement only r16 target (mod=3)
           if (op === 0x81) {
@@ -935,7 +1133,14 @@
             this.cycles += 5; // おおよそのサイクル数
             return;
           }
-
+          if (op === 0x74) {
+            // JZ rel8
+            const rel = (this.fetch8() << 24) >> 24; // sign-extend 8→32
+            if (this.getZF()) {
+              this.regs.IP = (this.regs.IP + rel) & 0xffff;
+            }
+            return;
+          }
           // JZ rel8 (74)
           if (op === 0x74) {
             const rel8 = this.sign8(this.fetch8());
@@ -971,10 +1176,21 @@
             this.cycles += 2;
             return;
           }
+          // JMP rel8 (0xEB)
+          if (op === 0xeb) {
+            const rel = (this.fetch8() << 24) >> 24; // 符号拡張
+            this.regs.IP = (this.regs.IP + rel) & 0xffff;
+            this.cycles += 15; // 目安
+            return;
+          }
+
+          throw new Error(
+            `Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
+              16
+            )}:${this.regs.IP.toString(16)}`
+          );
 
           // INT imm8 (CD nn)
-
-          this.cycles++;
         }
 
         loadBinary(buffer, offset = 0x0000) {
@@ -993,6 +1209,8 @@
       const $pc = document.getElementById("pc");
       const $cyc = document.getElementById("cyc");
       const $step = document.getElementById("stepBtn");
+      const canvas = document.getElementById("screen");
+      const video = new VideoTTY(canvas);
       $bin.addEventListener("change", async (e) => {
         const f = e.target.files?.[0];
         if (!f) return;
@@ -1005,9 +1223,6 @@
       });
       $step.addEventListener("click", () => {
         try {
-          const canvas = document.getElementById("screen");
-          const video = new VideoTTY(canvas);
-
           // エミュレータから参照できるように
           cpu.video = video;
           if (!cpu.halted) {
@@ -1046,9 +1261,6 @@
       let lastTime = 0;
 
       function runFrame(timestamp) {
-        const canvas = document.getElementById("screen");
-        const video = new VideoTTY(canvas);
-
         // エミュレータから参照できるように
         cpu.video = video;
         if (!running) return;
@@ -1057,6 +1269,7 @@
         const delta = timestamp - lastTime;
         lastTime = timestamp;
         cpu.handleInt10 = function () {
+          console.log("INT 10h", this.regs.AX.toString(16));
           const AH = (this.regs.AX >> 8) & 0xff;
           const AL = this.regs.AX & 0xff;
 
