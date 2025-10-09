@@ -700,16 +700,14 @@
           }
           // 他は必要に応じて
         }
-        handleInt16() {
-          console.log("INT 16h", this.regs.AX.toString(16));
+        handleInt16(ipBefore) {
           const AH = (this.regs.AX >> 8) & 0xff;
 
           if (AH === 0x00) {
-            // Read key (blocking)
             const key = this.kbd.getKeyBlocking();
             if (!key) {
-              this.regs.IP = (this.regs.IP - 2) & 0xFFFF; // CD 16 の位置に戻す
-      
+              // 入力が無ければ命令開始位置に戻す
+              this.regs.IP = ipBefore;
               return;
             }
             this.regs.AX = ((key.scancode & 0xff) << 8) | (key.ascii & 0xff);
@@ -717,7 +715,6 @@
           }
 
           if (AH === 0x01) {
-            // Check keystroke (non-blocking)
             const key = this.kbd.peek();
             if (key) {
               this.regs.AX = ((key.scancode & 0xff) << 8) | (key.ascii & 0xff);
@@ -728,7 +725,12 @@
             return;
           }
 
-          // Optionally implement AH=0x02 (get shift flags), etc.
+          if (AH === 0x02) {
+            this.regs.AX = 0; // シフト状態は常に0で簡易実装
+            return;
+          }
+
+          throw new Error(`INT 16h AH=${AH.toString(16)} 未実装`);
         }
 
         handleInt15() {
@@ -744,6 +746,7 @@
 
         step() {
           if (this.halted) return;
+          let ipBefore = this.regs.IP;
           const op = this.fetch8();
           console.log(
             "CS:IP",
@@ -752,6 +755,7 @@
             "op",
             op.toString(16)
           );
+
           // NOP
           if (op === 0x90) {
             this.cycles++;
@@ -766,7 +770,7 @@
               return;
             }
             if (intNum === 0x16) {
-              this.handleInt16();
+              this.handleInt16(ipBefore);
               return;
             }
             if (intNum === 0x15) {
@@ -1173,7 +1177,7 @@
 
           // JZ rel8 (0x74)
           if (op === 0x74) {
-            const rel = (this.fetch8() << 24) >> 24; // ここで必ず消費！
+            const rel = this.sign8(this.fetch8()); // 先に必ず消費
             if (this.getZF()) {
               this.regs.IP = (this.regs.IP + rel) & 0xffff;
             }
@@ -1201,11 +1205,11 @@
             return;
           }
 
-          throw new Error(
-            `Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
-              16
-            )}:${this.regs.IP.toString(16)}`
-          );
+          //throw new Error(
+            //`Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
+             // 16
+            //)}:${this.regs.IP.toString(16)}`
+          //);
 
           // INT imm8 (CD nn)
         }
@@ -1276,10 +1280,10 @@
       });
       let running = false;
       let lastTime = 0;
-
+      cpu.video = video;
       function runFrame(timestamp) {
         // エミュレータから参照できるように
-        cpu.video = video;
+
         if (!running) return;
 
         // 経過時間を計算
@@ -1304,7 +1308,7 @@
           // 他は必要に応じて
         };
         // 1フレームあたりの命令数を決める（例: 1msあたり500命令）
-        const steps = Math.floor(delta * 500);
+        const steps = Math.floor(delta * 10);
         for (let i = 0; i < steps && !cpu.halted; i++) {
           cpu.step();
         }
