@@ -2,7 +2,7 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8" />
-    <title>x86 by keita</title>
+    <title>by keita</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <style>
       :root {
@@ -706,7 +706,7 @@
           if (AH === 0x00) {
             const key = this.kbd.getKeyBlocking();
             if (!key) {
-              // 入力が無ければ命令開始位置に戻す
+              
               this.regs.IP = ipBefore;
               return;
             }
@@ -747,22 +747,28 @@
         step() {
           if (this.halted) return;
           let ipBefore = this.regs.IP;
-          const op = this.fetch8();
+          console.log(ipBefore);
           console.log(
             "CS:IP",
             this.regs.CS.toString(16),
             this.regs.IP.toString(16),
             "op",
-            op.toString(16)
+            
           );
-
+          console.log(this.regs.IP);
+          const op = this.fetch8();
+          
+          
           // NOP
+          
           if (op === 0x90) {
+            console.log("nop");
             this.cycles++;
             return;
           }
 
           if (op === 0xcd) {
+            
             console.log("INT instruction");
             const intNum = this.fetch8();
             if (intNum === 0x10) {
@@ -1179,18 +1185,16 @@
           if (op === 0x74) {
             const rel = this.sign8(this.fetch8()); // 先に必ず消費
             if (this.getZF()) {
+              console.log("aaaa");
               this.regs.IP = (this.regs.IP + rel) & 0xffff;
             }
             this.cycles += 2;
             return;
           }
-
-          // JNZ rel8 (0x75)
           if (op === 0x75) {
-            const rel = (this.fetch8() << 24) >> 24; // ここで必ず消費！
-            if (!this.getZF()) {
-              this.regs.IP = (this.regs.IP + rel) & 0xffff;
-            }
+            // JNZ rel8
+            const rel = this.sign8(this.fetch8());
+            if (!this.getZF()) this.regs.IP = (this.regs.IP + rel) & 0xffff;
             this.cycles += 2;
             return;
           }
@@ -1205,11 +1209,11 @@
             return;
           }
 
-          //throw new Error(
-            //`Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
-             // 16
-            //)}:${this.regs.IP.toString(16)}`
-          //);
+          throw new Error(
+            `Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
+              16
+            )}:${this.regs.IP.toString(16)}`
+          );
 
           // INT imm8 (CD nn)
         }
@@ -1308,7 +1312,7 @@
           // 他は必要に応じて
         };
         // 1フレームあたりの命令数を決める（例: 1msあたり500命令）
-        const steps = Math.floor(delta * 10);
+        const steps = Math.floor(delta * 1);
         for (let i = 0; i < steps && !cpu.halted; i++) {
           cpu.step();
         }
