@@ -634,7 +634,7 @@
           }
           return ones % 2 === 0;
         }
-        setFlagsArith8 = function (op, a, b, res) {
+        setFlagsArith8(op, a, b, res) {
           // マスク等
           a &= 0xff;
           b &= 0xff;
@@ -706,7 +706,6 @@
           if (AH === 0x00) {
             const key = this.kbd.getKeyBlocking();
             if (!key) {
-              
               this.regs.IP = ipBefore;
               return;
             }
@@ -720,7 +719,7 @@
               this.regs.AX = ((key.scancode & 0xff) << 8) | (key.ascii & 0xff);
               this.FLAGS &= ~(1 << 6); // ZF=0
             } else {
-              this.FLAGS |= 1 << 6; // ZF=1
+              this.FLAGS = (this.FLAGS & ~(1 << 6)) | (1 << 6); // ZF=1
             }
             return;
           }
@@ -752,15 +751,13 @@
             "CS:IP",
             this.regs.CS.toString(16),
             this.regs.IP.toString(16),
-            "op",
-            
+            "op"
           );
           console.log(this.regs.IP);
           const op = this.fetch8();
-          
-          
+
           // NOP
-          
+
           if (op === 0x90) {
             console.log("nop");
             this.cycles++;
@@ -768,7 +765,6 @@
           }
 
           if (op === 0xcd) {
-            
             console.log("INT instruction");
             const intNum = this.fetch8();
             if (intNum === 0x10) {
@@ -829,11 +825,10 @@
           // RET (C3) も SS:SP ベースで
           // RET (C3)
           if (op === 0xc3) {
-            const sPhys = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
-            const ip = this.read16(sPhys);
+            const p = ((this.regs.SS << 4) + this.regs.SP) & 0xfffff;
+            const ip = this.read16(p);
             this.regs.SP = (this.regs.SP + 2) & 0xffff;
-            this.regs.IP = ip;
-            this.cycles += 8; // 目安
+            this.regs.IP = ip & 0xffff;
             return;
           }
 
@@ -1209,13 +1204,13 @@
             return;
           }
 
-          throw new Error(
-            `Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
-              16
-            )}:${this.regs.IP.toString(16)}`
-          );
+          //throw new Error(
+            //`Unsupported opcode 0x${op.toString(16)} at ${this.regs.CS.toString(
+            //  16
+            //)}:${this.regs.IP.toString(16)}`
+          //);
 
-          // INT imm8 (CD nn)
+          
         }
 
         loadBinary(buffer, offset = 0x0000) {
