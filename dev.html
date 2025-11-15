@@ -673,7 +673,6 @@
           const seg = useSS ? this.regs.SS : this.regs.DS;
           return ((seg << 4) + (ea & 0xffff)) & 0xfffff;
         }
-
         readOperand8(mod, rm, ea) {
           if (mod === 3) return this.getReg8(rm);
           const useSS = this.usesBP(mod, rm);
@@ -977,6 +976,7 @@
             this.setReg16(rn, val);
             return;
           }
+
           if (op === 0x8a) {
             const { mod, reg, rm, ea } = this.decodeModRM();
             const val = this.readOperand8(mod, rm, ea);
@@ -989,6 +989,24 @@
             this.writeOperand8(mod, rm, ea, src);
             return;
           }
+
+          if (op === 0x38) {
+            const { mod, reg, rm, ea } = this.decodeModRM();
+            const dst = this.readOperand8.call(this, mod, rm, ea);
+            const src = this.getReg8(reg);
+            const res = (dst - src) & 0xff;
+            this.setFlagsArith8("cmp", dst, src, res);
+            return;
+          }
+          if (op === 0x3a) {
+            const { mod, reg, rm, ea } = this.decodeModRM();
+            const dst = this.getReg8(reg);
+            const src = this.readOperand8.call(this, mod, rm, ea);
+            const res = (dst - src) & 0xff;
+            this.setFlagsArith8("cmp", dst, src, res);
+            return;
+          }
+
           if (op === 0x84) {
             const { mod, reg, rm, ea } = this.decodeModRM();
             const a = this.readOperand8(mod, rm, ea);
